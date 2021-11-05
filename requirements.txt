@@ -1,0 +1,4 @@
+pip~=21.1.1
+cryptography~=35.0.0
+setuptools~=56.0.0
+binance-connector
