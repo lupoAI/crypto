@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-from constants import VALID_INTERVALS, VALID_INTERVALS_TO_TIME, CANDLES_HEADERS
+from constants import VALID_INTERVALS, VALID_INTERVALS_TO_TIME, CANDLES_HEADER
 
 BASE = "https://api.binance.com"
 API_PATHS = {"TIME": BASE + "/api/v3/time",
@@ -24,7 +24,7 @@ API_PATHS = {"TIME": BASE + "/api/v3/time",
              "24H": BASE + "/api/v3/ticker/24hr",
              "PRICE": BASE + "/api/v3/ticker/price",
              "ORDER_BOOK": BASE + "/api/v3/ticker/bookTicker"}
-INTERVAL_TO_BUCKETS = {"1m": 1,
+INTERVAL_TO_BUCKETS = {"1m": 6,
                        "3m": 1,
                        "5m": 1,
                        "15m": 5,
@@ -39,7 +39,7 @@ INTERVAL_TO_BUCKETS = {"1m": 1,
                        "3d": 10,
                        "1w": 10,
                        "1M": 10}
-START_HIST = '31/12/2009'
+START_HIST = '31/12/2016'
 
 # #TODO get them dynamically from api
 # request
@@ -276,18 +276,26 @@ class DataGetter:
             data = pd.DataFrame()
 
             start_end_range = zip(range_start, range_end)
+            empty_requests = 0
             exceptions = 0
             for st, nd in tqdm(start_end_range):
                 try:
                     temp = self.get_candles(interval, start_time=st, end_time=nd, limit=1000, save=False)
                     data = data.append(temp)
-                except Exception:
+                except Exception as err:
+                    print(err)
                     # TODO implement better exception handling
                     print(f"error for {st} and {nd}")
                     print(traceback.format_exc())
                     exceptions += 1
                     if exceptions == 10:
                         raise BinanceRequestException
+
+                if len(temp) == 0:
+                    empty_requests += 1
+                    if empty_requests == 10:
+                        print("Finished Data")
+                        break
 
             if len(data) == 0:
                 break
@@ -302,7 +310,7 @@ class DataGetter:
                 file_name += "_inc"
                 file_path = os.path.join(self.base_save_path, file_name + ".csv")
 
-            data.to_csv(file_path, header=CANDLES_HEADERS, index=False)
+            data.to_csv(file_path, header=CANDLES_HEADER, index=False)
 
             # We break the loop if we have less rows than expected and we
             if last or (len(data) < 0.1 * expected_rows) or (
@@ -323,8 +331,19 @@ class BinanceRequestException(Exception):
 
 
 if __name__ == "__main__":
-    coins_to_get = ["ETHUSDT", "BUSDUSDT", "BTCUSDT"]
-    base_save_path = "/Users/tanisha/Desktop/crypto/data/symbols"
+    base_save_path = r"G:\crypto\data\symbols"
+    exchange_info_path = r"G:\crypto\data\exchange"
+
+    exchange_info = pd.read_csv(os.path.join(exchange_info_path, "exchangeInfo.csv"))
+    coins_to_get = exchange_info.loc[:30, 'symbol']
+
     for coin in coins_to_get:
         c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
-        c.get_all_historical_candles(START_HIST)
+        c.get_historical_candles(START_HIST, '1m')
+    print("Done")
+
+    # coins_to_get = ["ETHUSDT", "BUSDUSDT", "BTCUSDT"]
+    # base_save_path = "/Users/tanisha/Desktop/crypto/data/symbols"
+    # for coin in coins_to_get:
+    #     c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
+    #     c.get_all_historical_candles(START_HIST)

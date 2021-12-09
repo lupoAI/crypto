@@ -1,5 +1,3 @@
-
-
 VALID_INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"]
 VALID_INTERVALS_TO_TIME = {"1m": 60 * 1000,
                            "3m": 3 * 60 * 1000,
@@ -17,5 +15,5 @@ VALID_INTERVALS_TO_TIME = {"1m": 60 * 1000,
                            "1w": 7 * 24 * 60 * 60 * 1000,
                            "1M": 30 * 24 * 60 * 60 * 1000}
 
-CANDLES_HEADERS = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume',
-                   'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
+CANDLES_HEADER = ['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume',
+                  'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
