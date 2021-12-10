@@ -4,6 +4,8 @@ import json
 import os
 import pickle
 import traceback
+import concurrent.futures
+import threading
 
 import numpy as np
 import pandas as pd
@@ -239,9 +241,8 @@ class DataGetter:
         i = 0
         last = False
         while True:
-
             start_ind = min(len(date_range_str) - 1, interval_bucket * (i + 1))
-            if start_ind == len(date_range_str):
+            if start_ind == len(date_range_str) - 1:
                 last = True
 
             start_date_str = date_range_str[start_ind]
@@ -252,6 +253,7 @@ class DataGetter:
             file_path_inc = os.path.join(self.base_save_path, file_name + "_inc.csv")
             if os.path.exists(file_path) or os.path.exists(file_path_inc):
                 if last:
+                    print()
                     break
                 i += 1
                 continue
@@ -273,29 +275,58 @@ class DataGetter:
                 range_start = np.append(range_start, range_m[-1])
                 range_end = np.append(range_end, end_date_m)
 
+
             data = pd.DataFrame()
 
-            start_end_range = zip(range_start, range_end)
+            start_end_range = zip(range_start[::-1], range_end[::-1])
             empty_requests = 0
             exceptions = 0
-            for st, nd in tqdm(start_end_range):
+            stop_execution = False
+            lock = threading.Lock()
+
+            def threaded_get_candles(time_range):
+
+                nonlocal data
+                nonlocal exceptions
+                nonlocal empty_requests
+                nonlocal stop_execution
+                nonlocal lock
+
+                print(time_range)
+                temp = pd.DataFrame()
+
+                if stop_execution:
+                    return None
                 try:
-                    temp = self.get_candles(interval, start_time=st, end_time=nd, limit=1000, save=False)
-                    data = data.append(temp)
+                    temp = self.get_candles(interval, start_time=time_range[0], end_time=time_range[1], limit=1000,
+                                            save=False)
+                    with lock:
+                        data = data.append(temp)
                 except Exception as err:
                     print(err)
                     # TODO implement better exception handling
-                    print(f"error for {st} and {nd}")
+                    print(f"error for {time_range[0]} and {time_range[1]}")
                     print(traceback.format_exc())
-                    exceptions += 1
+
+                    with lock:
+                        exceptions += 1
+
                     if exceptions == 10:
+                        stop_execution = True
                         raise BinanceRequestException
 
                 if len(temp) == 0:
-                    empty_requests += 1
+                    with lock:
+                        empty_requests += 1
                     if empty_requests == 10:
                         print("Finished Data")
-                        break
+                        stop_execution = True
+
+            executor = concurrent.futures.ThreadPoolExecutor(10)
+            executor.map(threaded_get_candles, start_end_range)
+            executor.shutdown(wait=True)
+
+            data = data.sort_values(by=0)
 
             if len(data) == 0:
                 break
@@ -338,6 +369,7 @@ if __name__ == "__main__":
     coins_to_get = exchange_info.loc[:30, 'symbol']
 
     for coin in coins_to_get:
+        print(f"started with {coin}")
         c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
         c.get_historical_candles(START_HIST, '1m')
     print("Done")
