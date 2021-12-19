@@ -1,16 +1,17 @@
+import concurrent.futures
 import datetime
 import datetime as dt
 import json
 import os
 import pickle
-import traceback
-import concurrent.futures
 import threading
+import traceback
+import time
+import glob
 
 import numpy as np
 import pandas as pd
 import requests
-from tqdm import tqdm
 
 from constants import VALID_INTERVALS, VALID_INTERVALS_TO_TIME, CANDLES_HEADER
 
@@ -42,8 +43,12 @@ INTERVAL_TO_BUCKETS = {"1m": 6,
                        "1w": 10,
                        "1M": 10}
 START_HIST = '31/12/2016'
+THREADS = 10
+BUFFER = 10
+REQUESTS_PER_MINUTE = 1200
 
 # #TODO get them dynamically from api
+# TODO modify all print into logs
 # request
 # REQUEST_WEIGHT =
 
@@ -275,9 +280,7 @@ class DataGetter:
                 range_start = np.append(range_start, range_m[-1])
                 range_end = np.append(range_end, end_date_m)
 
-
-            data = pd.DataFrame()
-
+            data = []
             start_end_range = zip(range_start[::-1], range_end[::-1])
             empty_requests = 0
             exceptions = 0
@@ -286,13 +289,15 @@ class DataGetter:
 
             def threaded_get_candles(time_range):
 
+                global THREADS
+                global REQUESTS_PER_MINUTE
+                global BUFFER
                 nonlocal data
                 nonlocal exceptions
                 nonlocal empty_requests
                 nonlocal stop_execution
                 nonlocal lock
 
-                print(time_range)
                 temp = pd.DataFrame()
 
                 if stop_execution:
@@ -301,7 +306,7 @@ class DataGetter:
                     temp = self.get_candles(interval, start_time=time_range[0], end_time=time_range[1], limit=1000,
                                             save=False)
                     with lock:
-                        data = data.append(temp)
+                        data.append(temp)
                 except Exception as err:
                     print(err)
                     # TODO implement better exception handling
@@ -313,7 +318,9 @@ class DataGetter:
 
                     if exceptions == 10:
                         stop_execution = True
-                        raise BinanceRequestException
+                        raise
+                finally:
+                    time.sleep((THREADS * 60) / REQUESTS_PER_MINUTE)
 
                 if len(temp) == 0:
                     with lock:
@@ -322,14 +329,16 @@ class DataGetter:
                         print("Finished Data")
                         stop_execution = True
 
-            executor = concurrent.futures.ThreadPoolExecutor(10)
+            started_threading = time.time()
+            executor = concurrent.futures.ThreadPoolExecutor(THREADS)
             executor.map(threaded_get_candles, start_end_range)
             executor.shutdown(wait=True)
+            print(f"Threading took {time.time() - started_threading} seconds")
 
-            data = data.sort_values(by=0)
-
+            data = pd.concat(data)
             if len(data) == 0:
                 break
+            data = data.sort_values(by=0)
 
             start_time_data = data.iloc[0, 0]
 
@@ -356,6 +365,119 @@ class DataGetter:
             self.get_historical_candles(start_date, interval)
             print(f"gotten {interval}")
 
+    def get_candles_from_millisecond_range(self, start, end, interval):
+        interval_milliseconds = VALID_INTERVALS_TO_TIME[interval]
+
+        range_m = np.arange(start, end, interval_milliseconds * 1000)
+        if len(range_m) == 0:
+            return None
+        elif len(range_m) == 1:
+            range_start = [int(start)]
+            range_end = [int(end)]
+        else:
+            range_start = range_m[:-1]
+            range_end = range_m[1:] - 1
+            range_start = np.append(range_start, range_m[-1]).astype(int)
+            range_end = np.append(range_end, end).astype(int)
+
+        data = []
+        start_end_range = zip(range_start[::-1], range_end[::-1])
+        empty_requests = 0
+        exceptions = 0
+        stop_execution = False
+        lock = threading.Lock()
+
+        def threaded_get_candles(time_range):
+
+            global THREADS
+            global REQUESTS_PER_MINUTE
+            global BUFFER
+            nonlocal data
+            nonlocal exceptions
+            nonlocal empty_requests
+            nonlocal stop_execution
+            nonlocal lock
+
+            temp = pd.DataFrame()
+
+            if stop_execution:
+                return None
+            try:
+                temp = self.get_candles(interval, start_time=time_range[0], end_time=time_range[1], limit=1000,
+                                        save=False)
+                with lock:
+                    data.append(temp)
+            except Exception as err:
+                print(err)
+                # TODO implement better exception handling
+                print(f"error for {time_range[0]} and {time_range[1]}")
+                print(traceback.format_exc())
+
+                with lock:
+                    exceptions += 1
+
+                if exceptions == 10:
+                    stop_execution = True
+                    raise
+            finally:
+                time.sleep((THREADS * 60) / REQUESTS_PER_MINUTE)
+
+            if len(temp) == 0:
+                with lock:
+                    empty_requests += 1
+                if empty_requests == 10:
+                    print("Finished Data")
+                    stop_execution = True
+
+        started_threading = time.time()
+        executor = concurrent.futures.ThreadPoolExecutor(THREADS)
+        executor.map(threaded_get_candles, start_end_range)
+        executor.shutdown(wait=True)
+        print(f"Threading took {time.time() - started_threading} seconds")
+
+        data = pd.concat(data)
+        if len(data) == 0:
+            return None
+        data = data.sort_values(by=0)
+
+        data.columns = CANDLES_HEADER
+
+        return data
+
+    def fill_candle_data_gaps(self, interval):
+        file_name = f"{self.symbol}_{interval}_*"
+        file = glob.glob(os.path.join(self.base_save_path, file_name))
+        if len(file) != 1:
+            #TODO make better error
+            raise ValueError(f"file is {file}")
+
+        data = pd.read_csv(file[0])
+
+        interval_milliseconds = VALID_INTERVALS_TO_TIME[interval]
+        diff = data.open_time.diff()
+        is_gap = diff.fillna(interval_milliseconds) > interval_milliseconds
+        gap_end = data.open_time[is_gap].values - 1
+        gap_start = (data.open_time.shift()[is_gap] + interval_milliseconds).values.astype(np.int64)
+        if len(gap_end) == 0:
+            print("there are no gaps")
+            return None
+
+        gap_data = []
+        for st, nd in zip(gap_start, gap_end):
+            gap_data += [self.get_candles_from_millisecond_range(st, nd, interval)]
+
+        gap_data = [x for x in gap_data if x is not None]
+        gap_data = [x for x in gap_data if len(x) > 1]
+        if len(gap_data) == 0:
+            print("no extra data was found")
+            return None
+
+        new_data = [data] + gap_data
+        new_data = pd.concat(new_data)
+        new_data = new_data.sort_values(by='open_time')
+
+        new_data.to_csv(file[0], index=False)
+
 
 class BinanceRequestException(Exception):
     pass
@@ -366,13 +488,17 @@ if __name__ == "__main__":
     exchange_info_path = r"G:\crypto\data\exchange"
 
     exchange_info = pd.read_csv(os.path.join(exchange_info_path, "exchangeInfo.csv"))
-    coins_to_get = exchange_info.loc[:30, 'symbol']
+    coins_to_get = exchange_info.loc[500:, 'symbol']
 
     for coin in coins_to_get:
-        print(f"started with {coin}")
+        print(f"{coin}: Started")
         c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
         c.get_historical_candles(START_HIST, '1m')
+        print(f"{coin}: Done")
     print("Done")
+
+    # c = DataGetter("BTCUSDT", pandas=True, base_save_path=base_save_path)
+    # c.fill_candle_data_gaps('1m')
 
     # coins_to_get = ["ETHUSDT", "BUSDUSDT", "BTCUSDT"]
     # base_save_path = "/Users/tanisha/Desktop/crypto/data/symbols"
