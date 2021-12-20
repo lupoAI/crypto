@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-from constants import VALID_INTERVALS, VALID_INTERVALS_TO_TIME, CANDLES_HEADER
+from constants import VALID_INTERVALS, VALID_INTERVALS_TO_TIME, CANDLES_HEADER, CANDLES_HEADER_TYPES, \
+    CANDLES_HEADER_TYPES_AN
 
 BASE = "https://api.binance.com"
 API_PATHS = {"TIME": BASE + "/api/v3/time",
@@ -44,8 +45,9 @@ INTERVAL_TO_BUCKETS = {"1m": 6,
                        "1M": 10}
 START_HIST = '31/12/2016'
 THREADS = 10
-BUFFER = 10
+BUFFER = 4
 REQUESTS_PER_MINUTE = 1200
+
 
 # #TODO get them dynamically from api
 # TODO modify all print into logs
@@ -233,101 +235,92 @@ class DataGetter:
 
         return self._handle_default_options(res, file_name)
 
-    def get_historical_candles(self, start_date, interval):
-        date_range = pd.date_range(start=start_date, end=dt.date.today(), freq='Y')
-        if date_range[-1].date() != dt.date.today():
-            date_range = date_range.append(pd.Index([pd.Timestamp.now()]))
-        date_range = date_range + dt.timedelta(days=1)
-        date_range_str = date_range.strftime("%Y")[::-1]
-        date_range_milliseconds = list(map(int, (date_range.view('<i8') / 1e6)))[::-1]
+    def get_historical_candles(self, start_date, interval, update=False):
+
+        data = []
+        empty_requests = 0
+        exceptions = 0
+        stop_execution = False
+        lock = threading.Lock()
+
+        def threaded_get_candles(time_range):
+
+            global THREADS
+            global REQUESTS_PER_MINUTE
+            global BUFFER
+            nonlocal data
+            nonlocal exceptions
+            nonlocal empty_requests
+            nonlocal stop_execution
+            nonlocal lock
+
+            if stop_execution:
+                return None
+
+            temp = pd.DataFrame()
+
+            try:
+                temp = self.get_candles(interval, start_time=time_range[0], end_time=time_range[1], limit=1000,
+                                        save=False)
+                with lock:
+                    data.append(temp)
+            except Exception as err:
+                print(err)
+                # TODO implement better exception handling
+                print(f"error for {time_range[0]} and {time_range[1]}")
+                print(traceback.format_exc())
+
+                with lock:
+                    exceptions += 1
+
+                if exceptions >= 10:
+                    with lock:
+                        stop_execution = True
+                        raise
+            finally:
+                time.sleep(((THREADS + BUFFER) * 60) / REQUESTS_PER_MINUTE)
+
+            if len(temp) == 0:
+                with lock:
+                    empty_requests += 1
+                if empty_requests == 10:
+                    print("Finished Data")
+                    with lock:
+                        stop_execution = True
+
+        file_name = f"{self.symbol}_{interval}.csv"
+        file_name = os.path.join(self.base_save_path, file_name)
+
+        file_exists = os.path.exists(file_name)
+
+        end_time = self.get_server_time()
         interval_milliseconds = VALID_INTERVALS_TO_TIME[interval]
-        interval_bucket = INTERVAL_TO_BUCKETS[interval]
 
-        i = 0
-        last = False
-        while True:
-            start_ind = min(len(date_range_str) - 1, interval_bucket * (i + 1))
-            if start_ind == len(date_range_str) - 1:
-                last = True
+        if file_exists and (not update):
+            return None
+        else:
+            if not file_exists:
+                start_time = int(pd.to_datetime(start_date).to_datetime64().view('<i8') / 10e6)
+            else:
+                data = pd.read_csv(file_name, header=None, skiprows=1)
+                data = data.astype(CANDLES_HEADER_TYPES_AN)
+                start_time = int(data.iloc[-1, 0] + interval_milliseconds)
+                data = [data]
 
-            start_date_str = date_range_str[start_ind]
-            end_date_str = date_range_str[interval_bucket * i]
+            range_m = np.arange(start_time, end_time, interval_milliseconds * 1000)
 
-            file_name = f"{self.symbol}_{interval}_{start_date_str}_{end_date_str}"
-            file_path = os.path.join(self.base_save_path, file_name + ".csv")
-            file_path_inc = os.path.join(self.base_save_path, file_name + "_inc.csv")
-            if os.path.exists(file_path) or os.path.exists(file_path_inc):
-                if last:
-                    print()
-                    break
-                i += 1
-                continue
-
-            start_date_m = date_range_milliseconds[start_ind]
-            end_date_m = date_range_milliseconds[interval_bucket * i]
-
-            expected_rows = (end_date_m - start_date_m) / interval_milliseconds
-
-            range_m = np.arange(start_date_m, end_date_m, interval_milliseconds * 1000)
             if len(range_m) == 0:
-                break
+                return None
             elif len(range_m) == 1:
-                range_start = [start_date_m]
-                range_end = [end_date_m]
+                range_start = [start_time]
+                range_end = [end_time]
             else:
                 range_start = range_m[:-1]
                 range_end = range_m[1:] - 1
                 range_start = np.append(range_start, range_m[-1])
-                range_end = np.append(range_end, end_date_m)
+                range_end = np.append(range_end, end_time)
 
-            data = []
             start_end_range = zip(range_start[::-1], range_end[::-1])
-            empty_requests = 0
-            exceptions = 0
-            stop_execution = False
-            lock = threading.Lock()
-
-            def threaded_get_candles(time_range):
-
-                global THREADS
-                global REQUESTS_PER_MINUTE
-                global BUFFER
-                nonlocal data
-                nonlocal exceptions
-                nonlocal empty_requests
-                nonlocal stop_execution
-                nonlocal lock
-
-                temp = pd.DataFrame()
-
-                if stop_execution:
-                    return None
-                try:
-                    temp = self.get_candles(interval, start_time=time_range[0], end_time=time_range[1], limit=1000,
-                                            save=False)
-                    with lock:
-                        data.append(temp)
-                except Exception as err:
-                    print(err)
-                    # TODO implement better exception handling
-                    print(f"error for {time_range[0]} and {time_range[1]}")
-                    print(traceback.format_exc())
-
-                    with lock:
-                        exceptions += 1
-
-                    if exceptions == 10:
-                        stop_execution = True
-                        raise
-                finally:
-                    time.sleep((THREADS * 60) / REQUESTS_PER_MINUTE)
-
-                if len(temp) == 0:
-                    with lock:
-                        empty_requests += 1
-                    if empty_requests == 10:
-                        print("Finished Data")
-                        stop_execution = True
 
             started_threading = time.time()
             executor = concurrent.futures.ThreadPoolExecutor(THREADS)
@@ -335,30 +328,15 @@ class DataGetter:
             executor.shutdown(wait=True)
             print(f"Threading took {time.time() - started_threading} seconds")
 
-            data = pd.concat(data)
-            if len(data) == 0:
-                break
+            data = pd.concat(data, ignore_index=True)
+            if len(data)==0:
+
+                return None
             data = data.sort_values(by=0)
-
-            start_time_data = data.iloc[0, 0]
-
-            # TODO maybe implement fix that changes start year in file path
-            # start_time_year = pd.to_datetime(data.loc[0,0] * 1e6).strftime("%Y")
-            # if start_time_year != start_date_str:
-
-            if i == 0:
-                file_name += "_inc"
-                file_path = os.path.join(self.base_save_path, file_name + ".csv")
-
-            data.to_csv(file_path, header=CANDLES_HEADER, index=False)
-
-            # We break the loop if we have less rows than expected and we
-            if last or (len(data) < 0.1 * expected_rows) or (
-                    range_start[0] + 10 * interval_milliseconds < start_time_data):
-                print(f"finished for symbol {self.symbol} and interval {interval}")
-                break
-
-            i += 1
+            data.columns = CANDLES_HEADER
+            data = data.drop_duplicates(subset=CANDLES_HEADER[0])
+            data = data.astype(CANDLES_HEADER_TYPES)
+            data.to_csv(file_name, index=None)
 
     def get_all_historical_candles(self, start_date):
         for interval in VALID_INTERVALS[::-1]:
@@ -398,10 +376,10 @@ class DataGetter:
             nonlocal stop_execution
             nonlocal lock
 
-            temp = pd.DataFrame()
-
             if stop_execution:
                 return None
+
+            temp = pd.DataFrame()
             try:
                 temp = self.get_candles(interval, start_time=time_range[0], end_time=time_range[1], limit=1000,
                                         save=False)
@@ -417,10 +395,11 @@ class DataGetter:
                     exceptions += 1
 
                 if exceptions == 10:
-                    stop_execution = True
-                    raise
+                    with lock:
+                        stop_execution = True
+                        raise
             finally:
-                time.sleep((THREADS * 60) / REQUESTS_PER_MINUTE)
+                time.sleep(((THREADS + BUFFER) * 60) / REQUESTS_PER_MINUTE)
 
             if len(temp) == 0:
                 with lock:
@@ -448,7 +427,7 @@ class DataGetter:
         file_name = f"{self.symbol}_{interval}_*"
         file = glob.glob(os.path.join(self.base_save_path, file_name))
         if len(file) != 1:
-            #TODO make better error
+            # TODO make better error
             raise ValueError(f"file is {file}")
 
         data = pd.read_csv(file[0])
@@ -488,7 +467,7 @@ if __name__ == "__main__":
     exchange_info_path = r"G:\crypto\data\exchange"
 
     exchange_info = pd.read_csv(os.path.join(exchange_info_path, "exchangeInfo.csv"))
-    coins_to_get = exchange_info.loc[500:, 'symbol']
+    coins_to_get = exchange_info.loc[20:, 'symbol']
 
     for coin in coins_to_get:
         print(f"{coin}: Started")
@@ -496,6 +475,12 @@ if __name__ == "__main__":
         c.get_historical_candles(START_HIST, '1m')
         print(f"{coin}: Done")
     print("Done")
+
+    # coin = 'BTCUSDT'
+    # print(f"{coin}: Started")
+    # c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
+    # c.get_historical_candles(START_HIST, '1m', update=True)
+    # print(f"{coin}: Done")
 
     # c = DataGetter("BTCUSDT", pandas=True, base_save_path=base_save_path)
     # c.fill_candle_data_gaps('1m')
