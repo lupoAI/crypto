@@ -467,7 +467,7 @@ if __name__ == "__main__":
     exchange_info_path = r"G:\crypto\data\exchange"
 
     exchange_info = pd.read_csv(os.path.join(exchange_info_path, "exchangeInfo.csv"))
-    coins_to_get = exchange_info.loc[20:, 'symbol']
+    coins_to_get = exchange_info.loc[:, 'symbol']
 
     for coin in coins_to_get:
         print(f"{coin}: Started")
