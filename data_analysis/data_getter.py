@@ -1,13 +1,12 @@
 import concurrent.futures
-import datetime
-import datetime as dt
+import glob
 import json
 import os
 import pickle
 import threading
-import traceback
 import time
-import glob
+import traceback
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -54,8 +53,7 @@ REQUESTS_PER_MINUTE = 1200
 # request
 # REQUEST_WEIGHT =
 
-
-class DataGetter:
+class DataGetterSymbol:
 
     def __init__(self, symbol: str, pandas: bool = False, base_save_path=None):
         self.symbol = symbol
@@ -79,6 +77,16 @@ class DataGetter:
     @staticmethod
     def _get_current_time_string():
         return datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+
+    def _get_url(self, request_type, params=None):
+        if request_type not in self.api_paths:
+            raise ValueError("Unknown Request Type")
+        endpoint = self.api_paths[request_type]
+        if params is None:
+            return endpoint
+        query = "&".join("{}={}".format(quote_plus(str(k)), quote_plus(str(v))) for k, v in params.items())
+        url = "{}?{}".format(endpoint, query)
+        return url
 
     def _handle_request(self, request_type, params=None):
         if request_type not in self.api_paths:
@@ -173,7 +181,7 @@ class DataGetter:
         file_name = f"{self.symbol}_aggTrades_{from_id}" if save else None
         raise self._handle_default_options(res, file_name)
 
-    def get_candles(self, interval, start_time=None, end_time=None, limit=500, save=True):
+    def get_candles(self, interval, start_time=None, end_time=None, limit=500, save=True, return_url=False):
         """
         refer to https://binance-docs.github.io/apidocs/spot/en/#kline-candlestick-data
         """
@@ -185,6 +193,8 @@ class DataGetter:
         params = {"symbol": self.symbol, "interval": interval, "limit": limit, "startTime": start_time,
                   "endTime": end_time}
         params = {k: v for k, v in params.items() if v is not None}
+        if return_url:
+            return self._get_url("CANDLES", params=params)
         res = self._handle_request("CANDLES", params=params)
         if (start_time is not None) and (end_time is not None):
             file_name = f"{self.symbol}_candles_{interval}_{start_time}_{end_time}"
@@ -235,7 +245,8 @@ class DataGetter:
 
         return self._handle_default_options(res, file_name)
 
-    def get_historical_candles(self, start_date, interval, update=False):
+    def get_historical_candles(self, start_date, interval, end_date=None, update=False, partition_by_date=False):
+        global THREADS
 
         data = []
         empty_requests = 0
@@ -293,14 +304,15 @@ class DataGetter:
 
         file_exists = os.path.exists(file_name)
 
-        end_time = self.get_server_time()
+        end_time = self.get_server_time() if end_date is None else int(
+            (pd.to_datetime(end_date, dayfirst=True) + pd.DateOffset(days=1)).to_datetime64().view('<i8') / 10e5) - 1
         interval_milliseconds = VALID_INTERVALS_TO_TIME[interval]
 
         if file_exists and (not update):
             return None
         else:
             if not file_exists:
-                start_time = int(pd.to_datetime(start_date).to_datetime64().view('<i8') / 10e6)
+                start_time = int(pd.to_datetime(start_date, dayfirst=True).to_datetime64().view('<i8') / 10e5)
             else:
                 data = pd.read_csv(file_name, header=None, skiprows=1)
                 data = data.astype(CANDLES_HEADER_TYPES_AN)
@@ -329,14 +341,55 @@ class DataGetter:
             print(f"Threading took {time.time() - started_threading} seconds")
 
             data = pd.concat(data, ignore_index=True)
-            if len(data)==0:
-
+            if len(data) == 0:
                 return None
             data = data.sort_values(by=0)
             data.columns = CANDLES_HEADER
             data = data.drop_duplicates(subset=CANDLES_HEADER[0])
             data = data.astype(CANDLES_HEADER_TYPES)
-            data.to_csv(file_name, index=None)
+            if not partition_by_date:
+                data.to_csv(file_name, index=False)
+            else:
+                data['date'] = pd.to_datetime(data['open_time'].values * 1000000).date
+                data['sym'] = self.symbol
+
+                dates = data['date'].unique()
+                print("Saving by date")
+                for date in dates:
+                    df_date = data[data['date'] == date]
+                    date_path = os.path.join(self.base_save_path,
+                                             str(date).replace(" ", "").replace(":", "").replace("-", "")) + ".csv"
+                    if not os.path.exists(date_path):
+                        df_date.to_csv(date_path, index=False)
+                    else:
+                        df_date.to_csv(date_path, index=False, mode='a', header=False)
+
+    def get_urls_for_historical_candles(self, start_date, end_date, interval="1m"):
+
+        start_time = int(pd.to_datetime(start_date, dayfirst=True).to_datetime64().view('<i8') / 10e5)
+        end_time = int(
+            (pd.to_datetime(end_date, dayfirst=True) + pd.DateOffset(days=1)).to_datetime64().view('<i8') / 10e5) - 1
+        interval_milliseconds = VALID_INTERVALS_TO_TIME[interval]
+
+        range_m = np.arange(start_time, end_time, interval_milliseconds * 1000)
+
+        if len(range_m) == 0:
+            return None
+        elif len(range_m) == 1:
+            range_start = [start_time]
+            range_end = [end_time]
+        else:
+            range_start = range_m[:-1]
+            range_end = range_m[1:] - 1
+            range_start = np.append(range_start, range_m[-1])
+            range_end = np.append(range_end, end_time)
+
+        start_end_range = zip(range_start[::-1], range_end[::-1])
+
+        urls = [self.get_candles(interval, start_time=st, end_time=et, limit=1000, return_url=True) for st, et in
+                start_end_range]
+
+        return urls
 
     def get_all_historical_candles(self, start_date):
         for interval in VALID_INTERVALS[::-1]:
@@ -344,6 +397,8 @@ class DataGetter:
             print(f"gotten {interval}")
 
     def get_candles_from_millisecond_range(self, start, end, interval):
+        global THREADS
+
         interval_milliseconds = VALID_INTERVALS_TO_TIME[interval]
 
         range_m = np.arange(start, end, interval_milliseconds * 1000)
@@ -458,31 +513,124 @@ class DataGetter:
         new_data.to_csv(file[0], index=False)
 
 
+def get_param_from_url(url, param_name):
+    return [i.split("=")[-1] for i in url.split("?", 1)[-1].split("&") if i.startswith(param_name + "=")]
+
+
+class ThreadedRequester:
+    data = []
+    empty_requests = 0
+    exceptions = 0
+    stop_execution = False
+    lock = threading.Lock()
+
+    @classmethod
+    def threaded_get_requests(cls, url):
+
+        global THREADS
+        global REQUESTS_PER_MINUTE
+        global BUFFER
+
+        if cls.stop_execution:
+            return None
+
+        try:
+            temp = cls.get_url(url)
+            symbol = get_param_from_url(url, "symbol")[0]
+            # start_time = get_param_from_url(url, "startTime")[0]
+            # temp['date'] = pd.to_datetime(start_time * 1000000).date().strftime("%Y-%m-%d")
+            temp["symbol"] = symbol
+            with cls.lock:
+                cls.data.append(temp)
+        except Exception as err:
+            print(err)
+            # TODO implement better exception handling
+            print(f"error for {url}")
+            print(traceback.format_exc())
+
+            with cls.lock:
+                cls.exceptions += 1
+
+            if cls.exceptions >= 10:
+                with cls.lock:
+                    cls.stop_execution = True
+                    raise
+        finally:
+            time.sleep(((THREADS + BUFFER) * 60) / REQUESTS_PER_MINUTE)
+
+    @classmethod
+    def get_url(cls, url):
+        req = requests.get(url)
+        if not req.ok:
+            raise ValueError(req.text, req.status_code)
+        return pd.DataFrame(json.loads(req.content))
+
+    @classmethod
+    def get_urls_data(cls, urls):
+        cls.data = []
+        cls.empty_requests = 0
+        cls.exceptions = 0
+        cls.stop_execution = False
+        executor = concurrent.futures.ThreadPoolExecutor(THREADS)
+        executor.map(cls.threaded_get_requests, urls)
+        executor.shutdown(wait=True)
+        return cls.data
+
+
+class DataGetterSymbolList:
+
+    def __init__(self, symbols: str, pandas: bool = False, base_save_path=None):
+        self.symbols = symbols
+        self.pandas = pandas
+        self.base_save_path = base_save_path
+        self.symbols_data_getters = [DataGetterSymbol(symbol, pandas, base_save_path) for symbol in symbols]
+
+
 class BinanceRequestException(Exception):
     pass
 
 
 if __name__ == "__main__":
-    base_save_path = r"G:\crypto\data\symbols"
-    exchange_info_path = r"G:\crypto\data\exchange"
+    import datetime
 
-    exchange_info = pd.read_csv(os.path.join(exchange_info_path, "exchangeInfo.csv"))
+    base_save_p = r"D:\crypto\data\dates2"
+    exchange_info_path = r"G:\crypto\data\exchange"
+    date_to_start = '02/01/2022'
+    date_range = pd.date_range(pd.to_datetime(date_to_start, dayfirst=True), datetime.date.today(), freq='1D').strftime(
+        '%d/%m/%Y').tolist()
+
+    exchange_info = DataGetterSymbol("None", pandas=True, base_save_path=None).get_exchange_info(get_all=True,
+                                                                                                 save=False)
     coins_to_get = exchange_info.loc[:, 'symbol']
 
     for coin in coins_to_get:
         print(f"{coin}: Started")
-        c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
+        c = DataGetterSymbol(coin, pandas=True, base_save_path=base_save_p)
         c.get_historical_candles(START_HIST, '1m')
         print(f"{coin}: Done")
+
+    # for dt in date_range:
+    #     print("Getting data for ", dt)
+    #     end_points = []
+    #     for coin in coins_to_get:
+    #         c = DataGetterSymbol(coin, pandas=True, base_save_path=base_save_p)
+    #         end_points += c.get_urls_for_historical_candles(dt, dt)
+    #     date_data = ThreadedRequester.get_urls_data(end_points)
+    #     date_data = pd.concat(date_data)
+    #     date_data.columns = CANDLES_HEADER + ['sym']
+    #     date_data = date_data.astype(CANDLES_HEADER_TYPES | {'sym': str})
+    #     date_data = date_data.sort_values(by=['sym','open_time'])
+    #     date_data.to_csv(os.path.join(base_save_p, f"{pd.to_datetime(dt, dayfirst=True).strftime('%Y%m%d')}.csv"), index=False)
+
     print("Done")
 
     # coin = 'BTCUSDT'
     # print(f"{coin}: Started")
-    # c = DataGetter(coin, pandas=True, base_save_path=base_save_path)
-    # c.get_historical_candles(START_HIST, '1m', update=True)
+    # c = DataGetterSymbol(coin, pandas=True, base_save_path=base_save_p)
+    # c.get_historical_candles('01/01/2022', '1m', end_date='01/01/2022', update=True)
     # print(f"{coin}: Done")
-
-    # c = DataGetter("BTCUSDT", pandas=True, base_save_path=base_save_path)
+    #
+    # c = DataGetterSymbol("BTCUSDT", pandas=True, base_save_path=base_save_p)
     # c.fill_candle_data_gaps('1m')
 
     # coins_to_get = ["ETHUSDT", "BUSDUSDT", "BTCUSDT"]

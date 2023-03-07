@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from constants import CANDLES_HEADER, VALID_INTERVALS, VALID_INTERVALS_TO_TIME
+from data_analysis.constants import CANDLES_HEADER, VALID_INTERVALS, VALID_INTERVALS_TO_TIME
 
 # import dask.dataframe as dd
 # from glob import glob
